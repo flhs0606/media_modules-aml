@@ -9299,6 +9299,17 @@ static void set_frame_info(struct hevc_state_s *hevc, struct vframe_s *vf,
 			vf->signal_type = data;
 		}
 
+		// Transfer==14 (BT2020-10) with BT.2020 primaries at 10-bit = HLG mislabel.
+		// Remap to 18 (ARIB_STD_B67) unconditionally — some streams lack the alternative
+		// transfer characteristics SEI and rely solely on the container/VUI metadata.
+		if ((((vf->signal_type >> 8) & 0xff) == 14) &&
+		    ((vf->signal_type >> 16) & 0xff) == 9) {
+			u32 data = vf->signal_type;
+			data = data & 0xFFFF00FF;
+			data = data | (18<<8);
+			vf->signal_type = data;
+		}
+
 		// If the existing transer characteristics is 14 (BT2020-10), and we have an alternative for 18 (HLG), then treat as HLG.
 		if ((((vf->signal_type >> 8) & 0xff) == 14) && (hevc->alternative_transfer_characteristics == 18)) {
 			u32 data = vf->signal_type;
