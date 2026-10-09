@@ -485,7 +485,6 @@ static u32 parser_dolby_vision_enable = 1;
 
 static u32 dolby_meta_with_el;
 static u32 dolby_el_flush_th = 2;
-static u32 dv_el_early_out = 1;
 
 /* this is only for h265 mmu enable */
 
@@ -1416,8 +1415,6 @@ struct hevc_state_s {
 	struct device *cma_dev;
 	unsigned char m_ins_flag;
 	unsigned char dolby_enhance_flag;
-	unsigned char dv_el_out_pending; /* EL: output at the end of the work */
-	int first_out_poc;	/* POC of the fast output first picture */
 	unsigned long buf_start;
 	u32 buf_size;
 	u32 mv_buf_size;
@@ -2176,8 +2173,6 @@ static void hevc_init_stru(struct hevc_state_s *hevc, struct BuffInfo_s *buf_spe
 	hevc->sei_present_flag = 0;
 	hevc->valve_count = 0;
 	hevc->first_pic_flag = 0;
-	hevc->first_out_poc = INVALID_POC;
-	hevc->dv_el_out_pending = 0;
 
 	hevc->decoded_poc = INVALID_POC;
 	hevc->start_process_time = 0;
@@ -4120,20 +4115,8 @@ static struct PIC_s *output_pic(struct hevc_state_s *hevc, unsigned char flush_f
 		}
 	}
 
-	/*
-	 * the first picture was output ahead (fast output): the next one to
-	 * come out is it again, marked at the next slice header. Dual layer
-	 * streams without reordering have it too; there it was shown twice,
-	 * one frame more in this layer than in the other one.
-	 */
-	if (pic_display && (hevc->sps_num_reorder_pics_0 ||
-		((vdec->master || vdec->slave) &&
-		pic_display->POC == hevc->first_out_poc)) &&
-		(hevc->vf_pre_count == 1) && (hevc->first_pic_flag == 1)) {
-		if (pic_display->output_ready == 1)
-			pic_display->output_ready = 0;
-		else
-			pic_display = NULL;
+	if (pic_display && hevc->sps_num_reorder_pics_0 && (hevc->vf_pre_count == 1) && (hevc->first_pic_flag == 1)) {
+		pic_display = NULL;
 		hevc->first_pic_flag = 2;
 	}
 
@@ -5950,54 +5933,6 @@ static void release_aux_data(struct hevc_state_s *hevc, struct PIC_s *pic)
 	}
 	pic->aux_data_buf = NULL;
 	pic->aux_data_size = 0;
-}
-
-/*
- * Dual layer EL: the EL of an access unit is done (the next NAL is the
- * BL's). Do the output part of hevc_pre_pic() now instead of at the
- * slice header of the next EL picture: the BL outputs a picture at its
- * next slice header, which comes before that, and then waits for a free
- * buffer (for the display), so the EL picture of every BL frame came a
- * whole decode cycle after it. The output set is the same (the pictures
- * of the access units done so far), so is the output order.
- */
-static void hevc_el_output_decoded(struct hevc_state_s *hevc)
-{
-	struct PIC_s *pic = get_pic_by_POC(hevc, hevc->decoded_poc);
-	struct PIC_s *pic_display;
-
-	/* done here, not again at the next slice header */
-	hevc->decoded_poc = INVALID_POC;
-	if (pic && (pic->POC != INVALID_POC)) {
-		/* PB skip control, as hevc_pre_pic() */
-		if (pic->error_mark == 0 && hevc->PB_skip_mode == 1)
-			hevc->ignore_bufmgr_error |= 0x1;
-		if (hevc->ignore_bufmgr_error & 1) {
-			if (hevc->PB_skip_count_after_decoding > 0)
-				hevc->PB_skip_count_after_decoding--;
-			else
-				hevc->ignore_bufmgr_error |= 0x2;
-		}
-		if (!pic->ip_mode)
-			pic->output_mark = 1;
-		hevc_invalidate_pic_caches(hevc);
-		pic->recon_mark = 1;
-		pic->dis_mark = 1;
-	}
-	do {
-		pic_display = output_pic(hevc, 0);
-		if (pic_display) {
-			if (should_skip_display(hevc, pic_display) ||
-			    (get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME) || (get_dbg_flag(hevc) & H265_DEBUG_NO_DISPLAY)) {
-				pic_display->output_ready = 0;
-			} else {
-				if (hevc->i_only & 0x1 && pic_display->slice_type != 2)
-					pic_display->output_ready = 0;
-				else
-					prepare_display_buf(hw_to_vdec(hevc), pic_display);
-			}
-		}
-	} while (pic_display);
 }
 
 static inline void hevc_pre_pic(struct hevc_state_s *hevc, struct PIC_s *pic)
@@ -10010,7 +9945,6 @@ static irqreturn_t vh265_isr_thread_fn(int irq, void *data)
 						} else {
 							prepare_display_buf(hw_to_vdec(hevc), pic_display);
 							hevc->first_pic_flag = 1;
-							hevc->first_out_poc = pic_display->POC;
 						}
 					}
 				}
@@ -10065,9 +9999,6 @@ static irqreturn_t vh265_isr_thread_fn(int irq, void *data)
 			hevc->decoded_poc = hevc->curr_POC;
 			hevc->decoding_pic = NULL;
 			hevc->dec_result = DEC_RESULT_DONE;
-			/* see hevc_el_output_decoded(), done by the work */
-			hevc->dv_el_out_pending = vdec->master && dv_el_early_out &&
-				(dec_status == HEVC_FIND_NEXT_PIC_NAL);
 			amhevc_stop();
 			reset_process_time(hevc);
 
@@ -12061,27 +11992,14 @@ static void vh265_work_implement(struct hevc_state_s *hevc, struct vdec_s *vdec,
 	wait_hevc_search_done(hevc);
 	ATRACE_COUNTER(hevc->trace.decode_work_time_name, TRACE_WORK_WAIT_SEARCH_DONE_END);
 
-	if (hevc->dv_el_out_pending) {
-		hevc->dv_el_out_pending = 0;
-		if (hevc->dec_result == DEC_RESULT_DONE)
-			hevc_el_output_decoded(hevc);
-	}
-
-	if (vdec->slave || vdec->master) {
-		struct vdec_s *next = vdec;
-
-		if (hevc->dec_result == DEC_RESULT_DONE) {
-			if (hevc->switch_dvlayer_flag)
-				next = vdec->slave ? vdec->slave : vdec->master;
-		} else if (vdec->master &&
-			hevc->dec_result != DEC_RESULT_AGAIN &&
-			hevc->dec_result != DEC_RESULT_GET_DATA &&
-			hevc->dec_result != DEC_RESULT_GET_DATA_RETRY) {
-			next = vdec->master;
-		}
+	if (hevc->switch_dvlayer_flag) {
 		hevc->switch_dvlayer_flag = 0;
-		vdec_set_next_sched(vdec, next);
-	}
+		if (vdec->slave)
+			vdec_set_next_sched(vdec, vdec->slave);
+		else if (vdec->master)
+			vdec_set_next_sched(vdec, vdec->master);
+	} else if (vdec->slave || vdec->master)
+		vdec_set_next_sched(vdec, vdec);
 
 	if (from == 1) {
 		if (work_pending(&hevc->work)) /* This is a timeout work */
@@ -13429,9 +13347,6 @@ MODULE_PARM_DESC(dolby_meta_with_el, "\n dolby_meta_with_el\n");
 
 module_param(dolby_el_flush_th, uint, 0664);
 MODULE_PARM_DESC(dolby_el_flush_th, "\n dolby_el_flush_th\n");
-
-module_param(dv_el_early_out, uint, 0664);
-MODULE_PARM_DESC(dv_el_early_out, "\n dv_el_early_out\n");
 
 module_param(mmu_enable, uint, 0664);
 MODULE_PARM_DESC(mmu_enable, "\n mmu_enable\n");
